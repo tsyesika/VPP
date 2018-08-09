@@ -36,9 +36,16 @@
  *  OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
  *  WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
+#include <stddef.h>
 
 #include <vlib/vlib.h>
 #include <vlib/threads.h>
+
+#include <vnet/ip/format.h>
+#include <vnet/ip/ip6.h> /* Seems to provide ip46_address_t */
+#include <vnet/ip/ip4.h>
+#include <vnet/tcp/tcp.h>
+#include <vnet/udp/udp.h>
 
 u8 *vnet_trace_dummy;
 
@@ -265,6 +272,46 @@ trace_apply_filter (vlib_main_t * vm)
   vec_free (traces_to_remove);
 }
 
+/*
+ * Filters packets based on specific characteristics.
+ * NB: Not to be confused with "trace filter"
+ */
+u32
+show_trace_pkt_filter (vlib_show_trace_filter_t *filters, vlib_trace_header_t *h)
+{
+  if (vec_len(filters) == 0)
+    return 1;
+  
+  /* Iterate through the nodes to see if we have a match on the filters */
+  vlib_trace_header_t *end = vec_end(h);
+  vlib_show_trace_filter_t *filter;
+  u8 matches = 0;
+  
+  while (h < end)
+    {
+      vec_foreach(filter, filters) {
+	if (h->node_index != filter->node_index)
+	  continue;
+	if (memcmp((h->data + filter->offset), filter->data, filter->size) == 0)
+	  matches++;
+	clib_warning("Filter not found a match.");
+	clib_warning("Node: %d", filter->node_index);
+	clib_warning("Offset: %d", filter->node_index);
+	clib_warning("Size: %d", filter->size);
+	for (u8 i = 0; i < filter->size; i++) {
+	  clib_warning("Data: %x", filter->data[i]);
+	}
+	for(u8 i = 0; i < filter->size; i++) {
+	  clib_warning("Trace data: %x", *(h->data + filter->offset + i));
+	}
+	break;
+      }
+      h = vlib_trace_header_next (h);
+    }
+  
+  return matches == vec_len(filters);
+}
+
 static clib_error_t *
 cli_show_trace_buffer (vlib_main_t * vm,
 		       unformat_input_t * input, vlib_cli_command_t * cmd)
@@ -275,6 +322,11 @@ cli_show_trace_buffer (vlib_main_t * vm,
   char *fmt;
   u8 *s = 0;
   u32 max;
+  vlib_show_trace_filter_t *filters = 0;
+  
+  ip46_address_t filter_ip = {0};
+  u16 filter_port = 0;
+  u8 filter_protocol = 0;
 
   /*
    * By default display only this many traces. To display more, explicitly
@@ -285,7 +337,104 @@ cli_show_trace_buffer (vlib_main_t * vm,
     {
       if (unformat (input, "max %d", &max))
 	;
+      else if (unformat (input, "src-ip %U", unformat_ip46_address, &filter_ip))
+	if (ip46_address_is_ip4(&filter_ip))
+	  {
+	    vlib_show_trace_filter_t ip4_filter;
+	    ip4_filter.node_index = ip4_input_node.index;
+	    ip4_filter.offset = offsetof(ip4_header_t, src_address);
+	    ip4_filter.size = sizeof(ip4_address_t);
+	    memcpy(ip4_filter.data, &filter_ip.ip4, ip4_filter.size);
+	    vec_add1(filters, ip4_filter);
+	  }
+	else
+	  {
+	    vlib_show_trace_filter_t ip6_filter;
+	    ip6_filter.node_index = ip6_input_node.index;
+	    ip6_filter.offset = offsetof(ip6_header_t, src_address);
+	    ip6_filter.size = sizeof(ip6_address_t);
+	    memcpy(ip6_filter.data, &filter_ip.ip6, ip6_filter.size);
+	    vec_add1(filters, ip6_filter);
+	  }
+      else if (unformat(input, "dst-ip %U", unformat_ip46_address, &filter_ip))
+	if (ip46_address_is_ip4(&filter_ip))
+	  {
+	    vlib_show_trace_filter_t ip4_filter;
+	    ip4_filter.node_index = ip4_input_node.index;
+	    ip4_filter.offset = offsetof(ip4_header_t, dst_address);
+	    ip4_filter.size = sizeof(ip4_address_t);
+	    memcpy(ip4_filter.data, &filter_ip.ip4, ip4_filter.size);
+	    vec_add1(filters, ip4_filter);
+	  }
+	else
+	  {
+	    vlib_show_trace_filter_t ip6_filter;
+	    ip6_filter.node_index = ip6_input_node.index;
+	    ip6_filter.offset = offsetof(ip6_header_t, dst_address);
+	    ip6_filter.size = sizeof(ip6_address_t);
+	    memcpy(ip6_filter.data, &filter_ip.ip6, ip6_filter.size);
+	    vec_add1(filters, ip6_filter);
+	  }
+      else if (unformat(input, "protocol %U", unformat_ip_protocol, &filter_protocol))
+	{
+	  /* We have to filter on both IPv4 and IPv6 as we don't know. */
+	  vlib_show_trace_filter_t protocol_filter_ip4;
+	  protocol_filter_ip4.node_index = ip4_input_node.index;
+	  protocol_filter_ip4.offset = offsetof(ip4_header_t, dst_address);
+	  protocol_filter_ip4.size = sizeof(u8);
+	  protocol_filter_ip4.data[0] = filter_protocol;
+	  vec_add1(filters, protocol_filter_ip4);
+
+	  vlib_show_trace_filter_t protocol_filter_ip6;
+	  protocol_filter_ip6.node_index = ip6_input_node.index;
+	  protocol_filter_ip6.offset = offsetof(ip6_header_t, protocol);
+	  protocol_filter_ip6.size = sizeof(u8);
+	  protocol_filter_ip6.data[0] = filter_protocol;
+	  vec_add1(filters, protocol_filter_ip6);
+	}
+      else if (unformat(input, "src-port %U", unformat_tcp_udp_port, &filter_port))
+	{
+	  /* We have to filter on both UDP and TCP unless the protocol has been specified */
+	  vlib_show_trace_filter_t generic_port_filter;
+	  generic_port_filter.offset = offsetof(tcp_header_t, src_port);
+	  generic_port_filter.size = sizeof(u16);
+	  memcpy(&generic_port_filter, &filter_port, generic_port_filter.size);
+	  
+	  if (filter_protocol == 0 || filter_protocol == 6)
+	    {
+	      vlib_show_trace_filter_t port_filter_tcp_ip4;
+	      memcpy(&port_filter_tcp_ip4, &generic_port_filter, sizeof(vlib_show_trace_filter_t));	      
+	      port_filter_tcp_ip4.node_index = tcp4_input_node.index;
+	      vec_add1(filters, port_filter_tcp_ip4);
+
+	      vlib_show_trace_filter_t port_filter_tcp_ip6;
+	      memcpy(&port_filter_tcp_ip6, &generic_port_filter, sizeof(vlib_show_trace_filter_t));
+	      port_filter_tcp_ip6.node_index = tcp6_input_node.index;
+	      vec_add1(filters, port_filter_tcp_ip6);
+	    }
+	  else if (filter_protocol == 0 || filter_protocol == 17)
+	    {
+	      vlib_show_trace_filter_t port_filter_udp_ip4;
+	      memcpy(&port_filter_udp_ip4, &generic_port_filter, sizeof(vlib_show_trace_filter_t));
+	      port_filter_udp_ip4.node_index = udp4_input_node.index;
+	      vec_add1(filters, port_filter_udp_ip4);
+
+	      vlib_show_trace_filter_t port_filter_udp_ip6;
+	      memcpy(&port_filter_udp_ip6, &generic_port_filter, sizeof(vlib_show_trace_filter_t));
+	      port_filter_udp_ip6.node_index = udp6_input_node.index;
+	      vec_add1(filters, port_filter_udp_ip6);
+	    }
+	  else if (filter_protocol != 0)
+	    {
+	      clib_error_create("Unable to filter on ports for protocols other than TCP or UDP");
+	    }
+	}
+      else if (unformat(input, "dst-port %U", unformat_tcp_udp_port, &filter_port))
+	{
+	  /* TODO. */
+	}
       else
+	/* TODO: Fix to make generic for filters */
 	return clib_error_create ("expected 'max COUNT', got `%U'",
 				  format_unformat_error, input);
     }
@@ -306,7 +455,8 @@ cli_show_trace_buffer (vlib_main_t * vm,
     traces = 0;
     pool_foreach (h, tm->trace_buffer_pool,
     ({
-      vec_add1 (traces, h[0]);
+      if (show_trace_pkt_filter(filters, h[0]) == 1)
+	vec_add1 (traces, h[0]); 
     }));
 
     if (vec_len (traces) == 0)
@@ -333,7 +483,7 @@ cli_show_trace_buffer (vlib_main_t * vm,
 
   done:
     vec_free (traces);
-
+    vec_free (filters);
     index++;
   }));
   /* *INDENT-ON* */
@@ -346,7 +496,7 @@ cli_show_trace_buffer (vlib_main_t * vm,
 /* *INDENT-OFF* */
 VLIB_CLI_COMMAND (show_trace_cli,static) = {
   .path = "show trace",
-  .short_help = "Show trace buffer [max COUNT]",
+  .short_help = "Show trace buffer [max COUNT] [src-ip IP] [dst-ip IP]",
   .function = cli_show_trace_buffer,
 };
 /* *INDENT-ON* */
